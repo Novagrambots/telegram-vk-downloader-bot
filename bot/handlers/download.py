@@ -52,6 +52,7 @@ from bot.i18n import t
 from bot.keyboards.inline import get_back_keyboard, get_quality_keyboard
 from bot.services.vk import (
     ContentUnavailableError,
+    ExtractorFailureError,
     FileTooLargeError,
     LiveStreamError,
     MusicNotSupportedError,
@@ -83,6 +84,10 @@ _ERROR_CATEGORY_LABELS = {
     "cookies_expired": "Cookies протухли — обнови через /update_cookies",
     "network": "Сетевая ошибка (таймаут/нет связи)",
     "too_large": "Файл слишком большой",
+    "extractor_error": (
+        "Движок не разобрал страницу VK — обнови yt-dlp/gallery-dl "
+        "(пересобрать образ) или залей свежие cookies"
+    ),
     "unknown": "Неизвестная ошибка",
 }
 
@@ -125,8 +130,11 @@ async def _send_fallback_alert(source: str, error: str) -> None:
     if category in _SILENT_CATEGORIES:
         return
 
-    # WARP получил блок IP — перезапускаем для смены IP
-    if source == "warp" and category in ("network", "unknown"):
+    # WARP получил блок IP — перезапускаем для смены IP.
+    # source приходит вида "vk.ytdlp.warp" / "vk.gdl.warp+cookies", поэтому
+    # проверяем вхождение, а не равенство (иначе рестарт не срабатывал никогда).
+    restarted = False
+    if "warp" in source and category in ("network", "unknown"):
         from bot.utils.docker import restart_warp
         restarted = await restart_warp()
         if restarted:
@@ -142,8 +150,8 @@ async def _send_fallback_alert(source: str, error: str) -> None:
     category_label = _ERROR_CATEGORY_LABELS.get(category, category)
 
     warp_note = ""
-    if source == "warp":
-        warp_note = "\n\n♻️ <i>WARP контейнер перезапущен для смены IP</i>"
+    if restarted:
+        warp_note = f"\n\n{E['refresh']} <i>WARP контейнер перезапущен для смены IP</i>"
 
     text = (
         f"{E['warning']} <b>Источник упал!</b>\n\n"
@@ -277,6 +285,9 @@ async def _handle_video_flow(
         return
     except ContentUnavailableError:
         await status.edit_text(t("error.deleted", lang), parse_mode="HTML")
+        return
+    except ExtractorFailureError:
+        await status.edit_text(t("error.extractor", lang), parse_mode="HTML")
         return
     except Exception as e:
         logger.exception("get_media_info упал: %s", e)
@@ -454,6 +465,8 @@ async def _download_and_send_video(
         await message.answer(t("error.deleted", lang), parse_mode="HTML")
     except MusicNotSupportedError:
         await message.answer(t("error.music_unsupported", lang), parse_mode="HTML")
+    except ExtractorFailureError:
+        await message.answer(t("error.extractor", lang), parse_mode="HTML")
     except VkDownloadError as e:
         logger.warning("VkDownloadError: %s", e)
         await message.answer(t("error.generic", lang), parse_mode="HTML")
@@ -644,6 +657,8 @@ async def _handle_doc_flow(message: Message, url: str, lang: str) -> None:
         await status.edit_text(t("error.closed_profile", lang), parse_mode="HTML")
     except ContentUnavailableError:
         await status.edit_text(t("error.deleted", lang), parse_mode="HTML")
+    except ExtractorFailureError:
+        await status.edit_text(t("error.extractor", lang), parse_mode="HTML")
     except Exception as e:
         logger.exception("download_doc упал: %s", e)
         await status.edit_text(t("error.generic", lang), parse_mode="HTML")
@@ -728,6 +743,8 @@ async def _handle_photo_flow(
         await status.edit_text(t("error.closed_profile", lang), parse_mode="HTML")
     except ContentUnavailableError:
         await status.edit_text(t("error.deleted", lang), parse_mode="HTML")
+    except ExtractorFailureError:
+        await status.edit_text(t("error.extractor", lang), parse_mode="HTML")
     except Exception as e:
         logger.exception("download_photo упал: %s", e)
         await status.edit_text(t("error.generic", lang), parse_mode="HTML")
@@ -797,6 +814,8 @@ async def _handle_post_flow(
         await status.edit_text(t("error.closed_profile", lang), parse_mode="HTML")
     except ContentUnavailableError:
         await status.edit_text(t("error.deleted", lang), parse_mode="HTML")
+    except ExtractorFailureError:
+        await status.edit_text(t("error.extractor", lang), parse_mode="HTML")
     except Exception as e:
         logger.exception("download_post упал: %s", e)
         await status.edit_text(t("error.generic", lang), parse_mode="HTML")

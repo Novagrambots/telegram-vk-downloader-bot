@@ -67,6 +67,24 @@ class LiveStreamError(VkDownloadError):
     """Это прямой эфир в реальном времени — не скачиваем."""
 
 
+class ExtractorFailureError(VkDownloadError):
+    """Движок (yt-dlp/gallery-dl) не смог разобрать страницу VK.
+
+    Типичные проявления: KeyError('params') — VK не отдал playerParams,
+    'NoneType' object has no attribute ... — внутренний сбой экстрактора,
+    'An extractor error has occurred'. Лечится обновлением движка либо
+    авторизацией (cookies), но не сменой IP.
+    """
+
+
+# Категории, которые не лечатся сменой источника (прокси/WARP) — на них
+# цепочку фолбэков останавливаем сразу. Исключение: 'private' — его может
+# вылечить cookies, см. _next_cookie_attempt().
+CONTENT_CATEGORIES = frozenset({
+    "private", "not_found", "geo_blocked", "live", "music_unsupported", "bad_url",
+})
+
+
 @dataclass
 class VkMediaInfo:
     """Метаданные медиа до скачивания."""
@@ -129,8 +147,11 @@ def classify_error(exc: BaseException | str) -> str:
       - 'network'          — таймауты / соединение
       - 'cookies_expired'  — cookies протухли / требует логин
       - 'too_large'        — размер превышен
+      - 'extractor_error'  — движок не разобрал страницу (KeyError, NoneType, ...)
       - 'unknown'          — всё прочее
     """
+    if isinstance(exc, ExtractorFailureError):
+        return "extractor_error"
     if isinstance(exc, MusicNotSupportedError):
         return "music_unsupported"
     if isinstance(exc, LiveStreamError):
@@ -148,15 +169,27 @@ def classify_error(exc: BaseException | str) -> str:
         "private profile" in msg
         or "private video" in msg
         or "access denied" in msg
-        or "this video is only available for friends" in msg
+        or "access restricted" in msg    # VK: "ERROR: [vk] Access restricted"
+        or "restricted access" in msg
+        or "only available for friends" in msg
+        or "only available to followers" in msg   # VK: "Video only available to followers"
+        or "only available for followers" in msg
+        or "available to followers" in msg
+        or "only available for registered users" in msg
         or "only available to signed-in users" in msg
         or "available to signed-in" in msg
         or "only available for signed-in" in msg
         or "login is required" in msg
+        or "please log in" in msg
+        or "sign in to confirm" in msg
         or "доступ запрещ" in msg
+        or "доступ ограничен" in msg
         or "закрытый профиль" in msg
         or "нет доступа" in msg
         or "только для авторизованных" in msg
+        or "только подписчикам" in msg
+        or "только для подписчиков" in msg
+        or "только для друзей" in msg
     ):
         return "private"
     if (
@@ -166,6 +199,11 @@ def classify_error(exc: BaseException | str) -> str:
         or "404" in msg
         or "deleted" in msg              # "this video has been deleted", "was deleted"
         or "no longer available" in msg
+        or "does not exist" in msg       # VK: "Video X does not exist."
+        or "author has been blocked" in msg
+        or "изъята из публичного доступа" in msg   # жалоба правообладателя
+        or "rightholder complaint" in msg
+        or "copyright holder" in msg
     ):
         return "not_found"
     if "geo" in msg or "region" in msg or "country" in msg or "not available in your" in msg:
@@ -198,6 +236,19 @@ def classify_error(exc: BaseException | str) -> str:
         return "bad_url"
     if "timeout" in msg or "timed out" in msg or "connection" in msg or "unreachable" in msg:
         return "network"
+    # Внутренний сбой движка: yt-dlp падает на VK, когда страница пришла не в том
+    # виде, который он ждёт (KeyError('params') — нет playerParams, AttributeError
+    # на None). Сменой IP не лечится — лечится cookies или обновлением yt-dlp.
+    if (
+        "an extractor error has occurred" in msg
+        or "please report this issue" in msg
+        or "keyerror" in msg
+        or "'nonetype' object has no attribute" in msg
+        or "nonetype object has no attribute" in msg
+        or "unable to extract" in msg
+        or "unable to download json" in msg
+    ):
+        return "extractor_error"
     return "unknown"
 
 
@@ -365,6 +416,96 @@ class VkDownloader:
         except Exception as e:
             logger.warning("on_source_failed callback упал: %s", e)
 
+    # ================ FALLBACK CHAIN RUNNER ================
+
+    @staticmethod
+    def _next_cookie_attempt(attempts: list, current: int) -> int | None:
+        """Индекс ближайшей попытки с cookies после current (или None).
+
+        Нужен для 'private': сменой IP закрытый контент не откроешь, а вот
+        авторизованные cookies — могут. Перепрыгиваем оставшиеся анонимные
+        попытки сразу на cookies, не тратя время на proxy/WARP.
+        """
+        for j in range(current + 1, len(attempts)):
+            if "cookies" in attempts[j][0]:
+                return j
+        return None
+
+    @staticmethod
+    def _alert_immediately(name: str, category: str) -> bool:
+        """Слать ли алерт админу прямо на этой неудачной попытке.
+
+        Промежуточные падения молчим (следующий источник может всё вытянуть —
+        админу это не инцидент), кроме двух случаев:
+          * cookies_expired — cookies надо обновить руками, это всегда сигнал;
+          * упавший WARP с сетевой ошибкой — по нему хендлер ротирует IP.
+        """
+        if category == "cookies_expired":
+            return True
+        return "warp" in name and category in ("network", "unknown")
+
+    async def _run_with_fallbacks(self, label: str, attempts: list, run_one):
+        """Прогнать очередь попыток, вернуть первый успех.
+
+        attempts — [(name, config), ...]; run_one(name, config) — корутина,
+        которая делает саму работу и бросает исключение при неудаче.
+
+        Контентные ошибки (CONTENT_CATEGORIES) обрывают цепочку сразу —
+        прокси/WARP их не лечат. FileTooLargeError пробрасывается как есть.
+        Алерт админу — один, по исчерпании всей цепочки (см. _alert_immediately).
+        """
+        last_err: Exception | None = None
+        content_err: Exception | None = None   # первая контентная (приват и т.п.)
+        alerted_cats: set[str] = set()         # по одному алерту на категорию за цепочку
+        failed_names: list[str] = []
+        i = 0
+        while i < len(attempts):
+            name, config = attempts[i]
+            try:
+                return await run_one(name, config)
+            except FileTooLargeError:
+                raise
+            except Exception as e:
+                cat = classify_error(e)
+                last_err = e
+                failed_names.append(name)
+
+                if cat in CONTENT_CATEGORIES:
+                    if content_err is None:
+                        content_err = e
+                    jump = (
+                        self._next_cookie_attempt(attempts, i)
+                        if cat == "private" else None
+                    )
+                    if jump is None:
+                        self._raise_categorized(e)
+                    logger.info(
+                        "%s [%s]: закрытый контент — пробуем cookies (%s)",
+                        label, name, attempts[jump][0],
+                    )
+                    i = jump
+                    continue
+
+                # unknown/extractor_error — кладём traceback в лог, иначе
+                # по одной строке ошибки причину не найти.
+                logger.warning(
+                    "%s [%s] упал (%s): %s", label, name, cat, e,
+                    exc_info=cat in ("unknown", "extractor_error"),
+                )
+                if self._alert_immediately(name, cat) and cat not in alerted_cats:
+                    self._fire_source_failed(f"{label}.{name}", e)
+                    alerted_cats.add(cat)
+            i += 1
+
+        # Цепочка исчерпана. Контентная причина (закрытый профиль и т.п.) важнее
+        # последней сетевой: юзеру нужен точный текст, админу — не нужен алерт.
+        final_err = content_err or last_err
+        if final_err is not None:
+            if content_err is None and not alerted_cats:
+                self._fire_source_failed(f"{label}.chain[{'→'.join(failed_names)}]", final_err)
+            self._raise_categorized(final_err)
+        raise VkDownloadError(f"{label}: no attempts")
+
     async def _run_ytdlp_extract(self, url: str, opts: dict, download: bool = False) -> dict:
         """Блокирующий yt-dlp.extract_info → executor."""
         import yt_dlp
@@ -403,31 +544,26 @@ class VkDownloader:
         base = {
             "skip_download": True,
         }
-        last_err: Exception | None = None
-        for name, opts in self._fallback_configs(base):
-            try:
-                t0 = time.monotonic()
-                info = await self._run_ytdlp_extract(url, opts, download=False)
-                logger.info(
-                    "[METRIC] vk get_info %.2fs source=%s type=%s url=%s",
-                    time.monotonic() - t0, name, media_type, url,
-                )
-                return self._parse_ytdlp_info(info, media_type)
-            except Exception as e:
-                last_err = e
-                cat = classify_error(e)
-                # контентные ошибки — не пытаемся fallback'ами, пробрасываем сразу
-                if cat in ("private", "not_found", "geo_blocked", "live", "music_unsupported", "bad_url"):
-                    self._raise_categorized(e)
-                logger.warning("yt-dlp info [%s] упал: %s", name, e)
-                self._fire_source_failed(f"vk.ytdlp.{name}", e)
 
-        # все попытки упали
-        if last_err:
-            self._raise_categorized(last_err)
-        raise VkDownloadError("get_info_failed")
+        async def _attempt(name: str, opts: dict) -> VkMediaInfo:
+            t0 = time.monotonic()
+            info = await self._run_ytdlp_extract(url, opts, download=False)
+            logger.info(
+                "[METRIC] vk get_info %.2fs source=%s type=%s url=%s",
+                time.monotonic() - t0, name, media_type, url,
+            )
+            return self._parse_ytdlp_info(info, media_type)
+
+        return await self._run_with_fallbacks(
+            "vk.ytdlp", self._fallback_configs(base), _attempt,
+        )
 
     def _parse_ytdlp_info(self, info: dict, media_type: str) -> VkMediaInfo:
+        # extract_info может вернуть None (VK отдал страницу без данных) —
+        # без этой проверки дальше был бы AttributeError на NoneType.
+        if not info:
+            raise ExtractorFailureError("ytdlp_returned_no_info")
+
         # yt-dlp на playlist вернёт entries
         entries = info.get("entries")
         if entries is not None:
@@ -537,46 +673,38 @@ class VkDownloader:
         if progress_callback:
             self._attach_progress_hook(base, progress_callback)
 
-        last_err: Exception | None = None
         t0 = time.monotonic()
-        try:
-            for name, opts in self._fallback_configs(base):
-                try:
-                    info = await self._run_ytdlp_extract(url, opts, download=True)
-                    file_path = self._find_downloaded_file_in(info, subdir)
-                    if not file_path or not os.path.exists(file_path):
-                        raise VkDownloadError("downloaded_file_missing")
-                    size = os.path.getsize(file_path)
-                    if size > MAX_FILE_SIZE * 1.5:
-                        # совсем огромный — чистим и жалуемся, автосплит лишь до 2*MAX
-                        self.cleanup_dir(subdir)
-                        raise FileTooLargeError(f"file {size} bytes")
-                    logger.info(
-                        "[METRIC] vk download_video %.2fs source=%s q=%s size=%.1fMB",
-                        time.monotonic() - t0, name, quality, size / 1024 / 1024,
-                    )
-                    return DownloadedItem(
-                        file_path=file_path,
-                        media_type="video",
-                        title=info.get("title", "VK Видео"),
-                        duration=info.get("duration"),
-                        width=info.get("width"),
-                        height=info.get("height"),
-                        work_dir=subdir,
-                    )
-                except FileTooLargeError:
-                    raise
-                except Exception as e:
-                    last_err = e
-                    cat = classify_error(e)
-                    if cat in ("private", "not_found", "geo_blocked", "live", "music_unsupported", "bad_url"):
-                        self._raise_categorized(e)
-                    logger.warning("yt-dlp download [%s] упал: %s", name, e)
-                    self._fire_source_failed(f"vk.ytdlp.{name}", e)
 
-            if last_err:
-                self._raise_categorized(last_err)
-            raise VkDownloadError("download_failed")
+        async def _attempt(name: str, opts: dict) -> DownloadedItem:
+            info = await self._run_ytdlp_extract(url, opts, download=True)
+            if not info:
+                raise ExtractorFailureError("ytdlp_returned_no_info")
+            file_path = self._find_downloaded_file_in(info, subdir)
+            if not file_path or not os.path.exists(file_path):
+                raise VkDownloadError("downloaded_file_missing")
+            size = os.path.getsize(file_path)
+            if size > MAX_FILE_SIZE * 1.5:
+                # совсем огромный — жалуемся, автосплит лишь до 2*MAX
+                # (subdir почистит внешний except BaseException)
+                raise FileTooLargeError(f"file {size} bytes")
+            logger.info(
+                "[METRIC] vk download_video %.2fs source=%s q=%s size=%.1fMB",
+                time.monotonic() - t0, name, quality, size / 1024 / 1024,
+            )
+            return DownloadedItem(
+                file_path=file_path,
+                media_type="video",
+                title=info.get("title", "VK Видео"),
+                duration=info.get("duration"),
+                width=info.get("width"),
+                height=info.get("height"),
+                work_dir=subdir,
+            )
+
+        try:
+            return await self._run_with_fallbacks(
+                "vk.ytdlp", self._fallback_configs(base), _attempt,
+            )
         except BaseException:
             # любая ошибка → чистим subdir
             self.cleanup_dir(subdir)
@@ -595,39 +723,30 @@ class VkDownloader:
         if progress_callback:
             self._attach_progress_hook(base, progress_callback)
 
-        last_err: Exception | None = None
-        try:
-            for name, opts in self._fallback_configs(base):
-                try:
-                    info = await self._run_ytdlp_extract(url, opts, download=True)
-                    file_path = self._find_downloaded_file_in(info, subdir)
-                    if not file_path:
-                        raise VkDownloadError("downloaded_file_missing")
-                    if os.path.getsize(file_path) > MAX_FILE_SIZE:
-                        self.cleanup_dir(subdir)
-                        raise FileTooLargeError("doc_too_large")
-                    ext = os.path.splitext(file_path)[1].lower()
-                    media_type = "animation" if ext == ".gif" else (
-                        "audio" if ext in (".mp3", ".m4a", ".ogg", ".opus") else "document"
-                    )
-                    return DownloadedItem(
-                        file_path=file_path,
-                        media_type=media_type,
-                        title=info.get("title", ""),
-                        work_dir=subdir,
-                    )
-                except FileTooLargeError:
-                    raise
-                except Exception as e:
-                    last_err = e
-                    cat = classify_error(e)
-                    if cat in ("private", "not_found", "geo_blocked", "live", "music_unsupported", "bad_url"):
-                        self._raise_categorized(e)
-                    self._fire_source_failed(f"vk.ytdlp.doc.{name}", e)
+        async def _attempt(name: str, opts: dict) -> DownloadedItem:
+            info = await self._run_ytdlp_extract(url, opts, download=True)
+            if not info:
+                raise ExtractorFailureError("ytdlp_returned_no_info")
+            file_path = self._find_downloaded_file_in(info, subdir)
+            if not file_path:
+                raise VkDownloadError("downloaded_file_missing")
+            if os.path.getsize(file_path) > MAX_FILE_SIZE:
+                raise FileTooLargeError("doc_too_large")
+            ext = os.path.splitext(file_path)[1].lower()
+            media_type = "animation" if ext == ".gif" else (
+                "audio" if ext in (".mp3", ".m4a", ".ogg", ".opus") else "document"
+            )
+            return DownloadedItem(
+                file_path=file_path,
+                media_type=media_type,
+                title=info.get("title", ""),
+                work_dir=subdir,
+            )
 
-            if last_err:
-                self._raise_categorized(last_err)
-            raise VkDownloadError("download_failed")
+        try:
+            return await self._run_with_fallbacks(
+                "vk.ytdlp.doc", self._fallback_configs(base), _attempt,
+            )
         except BaseException:
             self.cleanup_dir(subdir)
             raise
@@ -686,39 +805,29 @@ class VkDownloader:
         gallery-dl возвращает JSON-lines, из которых можно посчитать кол-во файлов.
         """
         # gallery-dl --simulate -j возвращает NDJSON метаданные
-        attempts = self._gallerydl_attempts()
-        last_err: Exception | None = None
-        for name, extra_args in attempts:
-            try:
-                items = await self._run_gallerydl_simulate(url, extra_args)
-                title = ""
-                if items:
-                    title = (
-                        items[0].get("title")
-                        or items[0].get("album_title")
-                        or items[0].get("description")
-                        or "VK"
-                    )[:200]
-                return VkMediaInfo(
-                    media_type=media_type,
-                    title=title or "VK",
-                    item_count=len(items),
-                    attachments=[
-                        {"type": it.get("extension", "photo"), "url": it.get("url", "")}
-                        for it in items
-                    ],
-                )
-            except Exception as e:
-                last_err = e
-                cat = classify_error(e)
-                if cat in ("private", "not_found", "geo_blocked", "live", "music_unsupported", "bad_url"):
-                    self._raise_categorized(e)
-                logger.warning("gallery-dl info [%s] упал: %s", name, e)
-                self._fire_source_failed(f"vk.gdl.{name}", e)
+        async def _attempt(name: str, extra_args: list[str]) -> VkMediaInfo:
+            items = await self._run_gallerydl_simulate(url, extra_args)
+            title = ""
+            if items:
+                title = (
+                    items[0].get("title")
+                    or items[0].get("album_title")
+                    or items[0].get("description")
+                    or "VK"
+                )[:200]
+            return VkMediaInfo(
+                media_type=media_type,
+                title=title or "VK",
+                item_count=len(items),
+                attachments=[
+                    {"type": it.get("extension", "photo"), "url": it.get("url", "")}
+                    for it in items
+                ],
+            )
 
-        if last_err:
-            self._raise_categorized(last_err)
-        raise VkDownloadError("get_info_failed")
+        return await self._run_with_fallbacks(
+            "vk.gdl", self._gallerydl_attempts(), _attempt,
+        )
 
     def _gallerydl_attempts(self) -> list[tuple[str, list[str]]]:
         """Порядок попыток для gallery-dl (аналогично yt-dlp-цепочке)."""
@@ -805,52 +914,43 @@ class VkDownloader:
         (он передан в каждом DownloadedItem.work_dir).
         """
         out_dir = tempfile.mkdtemp(prefix="vk_gdl_", dir=self.download_dir)
-        last_err: Exception | None = None
-        for name, extra_args in self._gallerydl_attempts():
-            try:
-                files = await self._run_gallerydl_download(url, out_dir, extra_args)
-                if not files:
-                    raise VkDownloadError("gallery-dl produced no files")
-                items: list[DownloadedItem] = []
-                for fp in files:
-                    ext = os.path.splitext(fp)[1].lower()
-                    if ext in (".mp4", ".mov", ".m4v", ".webm"):
-                        mt = "video"
-                    elif ext in (".gif",):
-                        mt = "animation"
-                    elif ext in (".mp3", ".m4a", ".ogg", ".opus", ".wav"):
-                        mt = "audio"
-                    elif ext in (".jpg", ".jpeg", ".png", ".webp"):
-                        mt = "photo"
-                    else:
-                        mt = "document"
 
-                    size = os.path.getsize(fp) if os.path.exists(fp) else 0
-                    if size > MAX_FILE_SIZE:
-                        # слишком большое одиночное вложение — пропускаем, файл удаляем
-                        self.cleanup_file(fp)
-                        continue
-                    items.append(DownloadedItem(file_path=fp, media_type=mt, work_dir=out_dir))
-                if not items:
-                    raise FileTooLargeError("all_attachments_too_large")
-                return items
-            except FileTooLargeError:
-                self.cleanup_dir(out_dir)
-                raise
-            except Exception as e:
-                last_err = e
-                cat = classify_error(e)
-                if cat in ("private", "not_found", "geo_blocked", "live", "music_unsupported", "bad_url"):
-                    # чистим out_dir и пробрасываем
-                    self.cleanup_dir(out_dir)
-                    self._raise_categorized(e)
-                logger.warning("gallery-dl download [%s] упал: %s", name, e)
-                self._fire_source_failed(f"vk.gdl.{name}", e)
+        async def _attempt(name: str, extra_args: list[str]) -> list[DownloadedItem]:
+            files = await self._run_gallerydl_download(url, out_dir, extra_args)
+            if not files:
+                raise VkDownloadError("gallery-dl produced no files")
+            items: list[DownloadedItem] = []
+            for fp in files:
+                ext = os.path.splitext(fp)[1].lower()
+                if ext in (".mp4", ".mov", ".m4v", ".webm"):
+                    mt = "video"
+                elif ext in (".gif",):
+                    mt = "animation"
+                elif ext in (".mp3", ".m4a", ".ogg", ".opus", ".wav"):
+                    mt = "audio"
+                elif ext in (".jpg", ".jpeg", ".png", ".webp"):
+                    mt = "photo"
+                else:
+                    mt = "document"
 
-        self.cleanup_dir(out_dir)
-        if last_err:
-            self._raise_categorized(last_err)
-        raise VkDownloadError("download_failed")
+                size = os.path.getsize(fp) if os.path.exists(fp) else 0
+                if size > MAX_FILE_SIZE:
+                    # слишком большое одиночное вложение — пропускаем, файл удаляем
+                    self.cleanup_file(fp)
+                    continue
+                items.append(DownloadedItem(file_path=fp, media_type=mt, work_dir=out_dir))
+            if not items:
+                raise FileTooLargeError("all_attachments_too_large")
+            return items
+
+        try:
+            return await self._run_with_fallbacks(
+                "vk.gdl", self._gallerydl_attempts(), _attempt,
+            )
+        except BaseException:
+            # успешный вызов уносит out_dir в work_dir итемов — чистим только при провале
+            self.cleanup_dir(out_dir)
+            raise
 
     async def _run_gallerydl_download(
         self, url: str, out_dir: str, extra_args: list[str],
@@ -912,9 +1012,11 @@ class VkDownloader:
     def _raise_categorized(self, exc: BaseException) -> None:
         """Преобразует низкоуровневую ошибку в доменное исключение."""
         if isinstance(exc, (FileTooLargeError, PrivateContentError, ContentUnavailableError,
-                            MusicNotSupportedError, LiveStreamError)):
+                            MusicNotSupportedError, LiveStreamError, ExtractorFailureError)):
             raise exc
         cat = classify_error(exc)
+        if cat == "extractor_error":
+            raise ExtractorFailureError(str(exc)) from exc
         if cat == "live":
             raise LiveStreamError(str(exc)) from exc
         if cat == "private":

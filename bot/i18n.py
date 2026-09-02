@@ -376,6 +376,24 @@ TRANSLATIONS = {
             "Send a link to a video, clip, photo, album, post or document."
         ),
     },
+    "error.extractor": {
+        "ru": (
+            f"{E['cross']} <b>Не удалось обработать это видео</b>\n\n"
+            "VK отдал страницу в неожиданном виде — обычно так бывает, когда запись "
+            "доступна только после входа в аккаунт. Попробуй другую ссылку или зайди позже."
+        ),
+        "uz": (
+            f"{E['cross']} <b>Bu videoni qayta ishlab bo‘lmadi</b>\n\n"
+            "VK sahifani kutilmagan ko‘rinishda qaytardi — odatda bu yozuv faqat "
+            "hisobga kirgandan keyin ochilishini bildiradi. Boshqa havolani yuboring "
+            "yoki keyinroq urinib ko‘ring."
+        ),
+        "en": (
+            f"{E['cross']} <b>Could not process this video</b>\n\n"
+            "VK returned the page in an unexpected form — usually that means the post "
+            "is only available to signed-in users. Try another link or come back later."
+        ),
+    },
     "error.unsupported_type": {
         "ru": (
             f"{E['cross']} <b>Тип ссылки не поддерживается</b>\n\n"
