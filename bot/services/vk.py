@@ -30,6 +30,18 @@ from bot.config import settings
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_proxy(url: str | None) -> str:
+    """Прокси для лога без логина/пароля: scheme://host:port"""
+    from urllib.parse import urlsplit
+
+    try:
+        p = urlsplit(url or "")
+        return f"{p.scheme}://{p.hostname}:{p.port}" if p.hostname else "задан"
+    except ValueError:
+        return "задан"
+
+
 # Лимит Telegram Local Bot API — 2 ГБ. Под это же settings.max_file_size.
 MAX_FILE_SIZE = settings.max_file_size
 
@@ -267,7 +279,7 @@ class VkDownloader:
         self.on_source_failed: Callable[[str, str], None] | None = None
 
         if self._proxy:
-            logger.info("VK: резидентный прокси: %s", self._proxy)
+            logger.info("VK: резидентный прокси: %s", _safe_proxy(self._proxy))
         else:
             logger.info("VK: резидентный прокси не задан")
         logger.info("VK: WARP fallback: %s", self.WARP_PROXY)
